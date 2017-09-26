@@ -8,12 +8,9 @@ import time
 
 import krakenex
 import requests
-# from enum import Enum
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, Job, CallbackQueryHandler, ConversationHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, Job, CallbackQueryHandler
 
-from decorators import restrict_access
-from utils import get_chat_id
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
@@ -34,28 +31,9 @@ updater = Updater(token=config["bot_token"])
 dispatcher = updater.dispatcher
 job_queue = updater.job_queue
 
-# Define Enum for callback hierarchy
-ONE, TWO, THREE, FOUR = range(4)
-
-
-# Add a custom keyboard with all available commands
-def show_cmds(bot, updater):
-    chat_id = get_chat_id(updater)
-    kraken_btn = [
-        KeyboardButton("/trade", callback_data="trade"),
-        KeyboardButton("/orders", callback_data="orders"),
-        KeyboardButton("/balance", callback_data="balance"),
-        KeyboardButton("/price", callback_data="price"),
-        KeyboardButton("/value", callback_data="value"),
-        KeyboardButton("/status", callback_data="status")
-    ]
-
-    markup = ReplyKeyboardMarkup(build_menu(kraken_btn, n_cols=3, header_buttons=None, footer_buttons=None))
-    updater.bot.send_message(chat_id, "Enter a command", reply_markup=markup)
-
 
 # Create a button menu to show in Telegram messages
-def build_menu(buttons, n_cols=1, header_buttons=None, footer_buttons=None):
+def build_menu(buttons, n_cols, header_buttons, footer_buttons):
     menu = [buttons[i:i + n_cols] for i in range(0, len(buttons), n_cols)]
 
     if header_buttons:
@@ -98,15 +76,14 @@ def monitor_order(bot, job):
 
 
 # Monitor status changes of open orders
-def monitor_open_orders(bot, updater):
-    chat_id = get_chat_id(updater)
+def monitor_open_orders():
     if config["check_trade"].lower() == "true":
         # Send request for open orders to Kraken
         res_data = kraken.query_private("OpenOrders")
 
         # If Kraken replied with an error, show it
         if res_data["error"]:
-            updater.bot.send_message(chat_id=config["user_ids"], text=res_data["error"][0])
+            updater.bot.send_message(chat_id=config["user_id"], text=res_data["error"][0])
             return
 
         # Get time in seconds from config
@@ -117,7 +94,7 @@ def monitor_open_orders(bot, updater):
                 order_txid = str(order)
 
                 # Create context object with chat ID and order TXID
-                context_data = dict(chat_id=config["user_ids"], order_txid=order_txid)
+                context_data = dict(chat_id=config["user_id"], order_txid=order_txid)
 
                 # Create job to check status of order
                 job_check_order = Job(monitor_order, check_trade_time, context=context_data)
@@ -141,8 +118,14 @@ def trim_zeros(value_to_trim):
 
 
 # Get balance of all currencies
-@restrict_access(config["user_ids"])
-def balance_cmd(bot, update, chat_id=None):
+def balance(bot, update):
+    chat_id = get_chat_id(update)
+
+    # Check if user is valid
+    if str(chat_id) != config["user_id"]:
+        bot.send_message(chat_id, text="Access denied")
+        return
+
     # Save message parameters in list
     msg_params = update.message.text.split(" ")
 
@@ -178,118 +161,135 @@ def balance_cmd(bot, update, chat_id=None):
     bot.send_message(chat_id, text=msg)
 
 
-# Create orders to buy or sell currencies with price limit - choose 'buy' or 'sell'
-@restrict_access(config["user_ids"])
-def trade_cmd(bot, update, chat_id=None):
-
-    buttons = [
-        InlineKeyboardButton("buy", callback_data="buy"),
-        InlineKeyboardButton("sell", callback_data="sell"),
-    ]
-
-    footer = [
-        InlineKeyboardButton("Cancel", callback_data="cancel")
-    ]
-
-    reply_markup = InlineKeyboardMarkup(build_menu(buttons, n_cols=2, footer_buttons=footer))
-    bot.send_message(chat_id, "BUY or SELL?", reply_markup=reply_markup)
-
-    return ONE
-
-
-# Callback for the 'trade' command - choose the currency
-def trade_one(bot, update):
+# Create orders to buy or sell currencies with price limit
+def trade(bot, update):
     chat_id = get_chat_id(update)
-    message_id = update.callback_query.message.message_id
 
-    data = update.callback_query.data
-
-    if data == "cancel":
-        bot.edit_message_text("Canceled...", chat_id, message_id)
+    # Check if user is valid
+    if str(chat_id) != config["user_id"]:
+        bot.send_message(chat_id, text="Access denied")
         return
 
-    buttons = [
-        InlineKeyboardButton("XXBT", callback_data="xxbt"),
-        InlineKeyboardButton("XETH", callback_data="xeth"),
-        InlineKeyboardButton("XXMR", callback_data="xxmr")
-    ]
+    # Save message parameters in list
+    msg_params = update.message.text.split(" ")
 
-    footer = [
-        InlineKeyboardButton("Cancel", callback_data="cancel")
-    ]
-
-    reply_markup = InlineKeyboardMarkup(build_menu(buttons, n_cols=3, footer_buttons=footer))
-    bot.edit_message_text(data + "\nEnter currency to " + data, chat_id, message_id, reply_markup=reply_markup)
-
-    return TWO
-
-
-# Callback for the 'status' command - enter price per unit
-def trade_two(bot, update):
-    chat_id = get_chat_id(update)
-    message_id = update.callback_query.message.message_id
-
-    data = update.callback_query.data
-
-    if data == "cancel":
-        bot.edit_message_text("Canceled...", chat_id, message_id)
+    # No arguments entered, just the '/trade' command
+    if len(msg_params) == 1:
+        msg = "Syntax: /trade ['buy' / 'sell'] [currency] [price per unit] ([volume] / [amount'eur'])"
+        bot.send_message(chat_id, text=msg)
         return
 
-    buttons = [
-        InlineKeyboardButton("Cancel", callback_data="cancel")
-    ]
+    # Volume is specified
+    if len(msg_params) == 5:
+        if msg_params[4].upper().endswith(config["trade_to_currency"]):
+            amount = float(msg_params[4][:-len(config["trade_to_currency"])])
+            price_per_unit = float(msg_params[3])
+            volume = "{0:.8f}".format(amount / price_per_unit)
+        else:
+            volume = msg_params[4]
+    # Volume is NOT specified
+    elif len(msg_params) == 4:
+        buy = "buy"
+        sell = "sell"
 
-    line_brk_index = update.callback_query.message.index("\n")
-    cmd = update.callback_query.message[0:line_brk_index]
+        # Logic for 'buy'
+        if msg_params[1] == buy:
+            req_data = dict()
+            req_data["asset"] = "Z" + config["trade_to_currency"]
 
-    reply_markup = InlineKeyboardMarkup(build_menu(buttons))
-    bot.edit_message_text(
-        cmd + " " + data + "\nEnter price per unit",
-        chat_id,
-        message_id,
-        reply_markup=reply_markup)
+            # Send request to Kraken to get current trade balance of all currencies
+            res_data = kraken.query_private("TradeBalance", req_data)
 
-    return THREE
+            # If Kraken replied with an error, show it
+            if res_data["error"]:
+                bot.send_message(chat_id, text=res_data["error"][0])
+                return
 
+            euros = res_data["result"]["tb"]
+            # Calculate volume depending on full euro balance and round it to 8 digits
+            volume = "{0:.8f}".format(float(euros) / float(msg_params[3]))
+        # Logic for 'sell'
+        elif msg_params[1] == "sell":
 
-# Callback for the 'status' command - enter volume
-def trade_three(bot, update):
-    chat_id = get_chat_id(update)
-    message_id = update.callback_query.message.message_id
+            # Send request to Kraken to get euro balance to calculate volume
+            res_data = kraken.query_private("Balance")
 
-    data = update.callback_query.data
+            # If Kraken replied with an error, show it
+            if res_data["error"]:
+                bot.send_message(chat_id, text=res_data["error"][0])
+                return
 
-    if data == "cancel":
-        bot.edit_message_text("Canceled...", chat_id, message_id)
+            current_volume = res_data["result"][msg_params[2].upper()]
+            # Get volume from balance and round it to 8 digits
+            volume = "{0:.8f}".format(float(current_volume))
+        else:
+            msg = "Argument should be '" + buy + "' or '" + sell + "' but is '" + msg_params[1] + "'"
+            bot.send_message(chat_id, text=msg)
+            return
+    else:
+        msg = "Syntax: /trade ['buy' / 'sell'] [currency] [price per unit] ([volume] / [amount'eur'])"
+        bot.send_message(chat_id, text=msg)
         return
 
-    buttons = [
-        InlineKeyboardButton("Cancel", callback_data="cancel")
-    ]
+    req_data = dict()
+    req_data["type"] = msg_params[1]
+    req_data["pair"] = msg_params[2] + "Z" + config["trade_to_currency"]
+    req_data["price"] = msg_params[3]
+    req_data["ordertype"] = "limit"
+    req_data["volume"] = volume
 
-    reply_markup = InlineKeyboardMarkup(build_menu(buttons))
-    bot.edit_message_text(data + "\Enter volume", chat_id, message_id, reply_markup=reply_markup)
+    # Send request to create order to Kraken
+    res_data_add_order = kraken.query_private("AddOrder", req_data)
 
-    return THREE
+    # If Kraken replied with an error, show it
+    if res_data_add_order["error"]:
+        bot.send_message(chat_id, text=res_data_add_order["error"][0])
+        return
 
+    # If there is a transaction id then the order was placed successfully
+    if res_data_add_order["result"]["txid"]:
+        add_order_txid = res_data_add_order["result"]["txid"][0]
 
-# Callback for the 'status' command - enter volume
-def trade_four(bot, update):
-    chat_id = get_chat_id(update)
-    message_id = update.callback_query.message.message_id
+        req_data = dict()
+        req_data["txid"] = add_order_txid
 
-    data = update.callback_query.data
+        # Send request to get info on specific order
+        res_data_query_order = kraken.query_private("QueryOrders", req_data)
 
-    # TODO: Add logic to execute trade command on kraken
+        # If Kraken replied with an error, show it
+        if res_data_query_order["error"]:
+            bot.send_message(chat_id, text=res_data["error"][0])
+            return
 
-    bot.edit_message_text(data + "COMMAND COMPLETE", chat_id, message_id)
+        if res_data_query_order["result"][add_order_txid]:
+            order_desc = res_data_query_order["result"][add_order_txid]["descr"]["order"]
+            bot.send_message(chat_id, text="Order placed: " + add_order_txid + "\n" + trim_zeros(order_desc))
 
-    return FOUR
+            if config["check_trade"].lower() == "true":
+                # Get time in seconds from config
+                check_trade_time = config["check_trade_time"]
+                # Create context object with chat ID and order TXID
+                context_data = dict(chat_id=update.message.chat_id, order_txid=add_order_txid)
+
+                # Create job to check status of newly created order
+                job_check_order = Job(monitor_order, check_trade_time, context=context_data)
+                job_queue.put(job_check_order, next_t=0.0)
+            return
+        else:
+            bot.send_message(chat_id, text="No order with TXID " + add_order_txid)
+            return
+    else:
+        bot.send_message(chat_id, text="Undefined state: no error and no TXID")
 
 
 # Show and manage orders
-@restrict_access(config["user_ids"])
-def orders_cmd(bot, update, chat_id=None):
+def orders(bot, update):
+    chat_id = get_chat_id(update)
+
+    # Check if user is valid
+    if str(chat_id) != config["user_id"]:
+        bot.send_message(chat_id, text="Access denied")
+        return
 
     # Save message parameters in list
     msg_params = update.message.text.split(" ")
@@ -367,8 +367,14 @@ def orders_cmd(bot, update, chat_id=None):
 
 
 # Show syntax for all available commands
-@restrict_access(config["user_ids"])
-def syntax_cmd(bot, update, chat_id=None):
+def syntax(bot, update):
+    chat_id = get_chat_id(update)
+
+    # Check if user is valid
+    if str(chat_id) != config["user_id"]:
+        bot.send_message(chat_id, text="Access denied")
+        return
+
     syntax_msg = "/balance (['available'])\n"
     syntax_msg += "/trade ['buy' / 'sell'] [currency] [price per unit] ([volume] / [amount'eur'])\n"
     syntax_msg += "/orders (['close'] [txid] / 'close-all'])\n"
@@ -381,49 +387,35 @@ def syntax_cmd(bot, update, chat_id=None):
     bot.send_message(chat_id, text=syntax_msg)
 
 
-# TODO: Remove ReplyKeyboard as long as we are in the execution of a command. After complete execution, add it again
-# Show the current price for the chosen currency
-@restrict_access(config["user_ids"])
-def price_cmd(bot, update, chat_id=None):
-
-    buttons = [
-        InlineKeyboardButton("XBT", callback_data="xbt"),
-        InlineKeyboardButton("ETH", callback_data="eth"),
-        InlineKeyboardButton("XMR", callback_data="xmr")
-    ]
-
-    footer = [
-        InlineKeyboardButton("Cancel", callback_data="cancel")
-    ]
-
-    reply_markup = InlineKeyboardMarkup(build_menu(buttons, n_cols=3, footer_buttons=footer))
-    bot.send_message(chat_id, "Price for which currency?", reply_markup=reply_markup)
-
-    return ONE
-
-
-# Callback for the 'price' command - choose currency
-def price_one(bot, update):
+# Show last trade price for given currency
+def price(bot, update):
     chat_id = get_chat_id(update)
-    message_id = update.callback_query.message.message_id
 
-    data = update.callback_query.data
+    # Check if user is valid
+    if str(chat_id) != config["user_id"]:
+        bot.send_message(chat_id, text="Access denied")
+        return
+
+    # Save message parameters in list
+    msg_params = update.message.text.split(" ")
+
+    if len(msg_params) == 1:
+        bot.send_message(chat_id, text="Syntax: /price [currency] ([currency] ...)")
+        return
 
     req_data = dict()
+    req_data["pair"] = ""
 
-    # TODO: Create an Enum for this values
-    if data == "xbt":
-        req_data["pair"] = "XXBT" + "Z" + config["trade_to_currency"]
-    elif data == "eth":
-        req_data["pair"] = "XETH" + "Z" + config["trade_to_currency"]
-    elif data == "xmr":
-        req_data["pair"] = "XXMR" + "Z" + config["trade_to_currency"]
-    elif data == "cancel":
-        bot.edit_message_text("Canceled...", chat_id, message_id)
-        return
-    else:
-        bot.edit_message_text("Unknown callback command...", chat_id, message_id)
-        return
+    # Loop over all parameters (except first) and add them as currencies to request
+    first = True
+    for param in msg_params:
+        if first:
+            first = False
+        else:
+            req_data["pair"] += param + "Z" + config["trade_to_currency"] + ","
+
+    # Remove last comma from 'pair' string
+    req_data["pair"] = req_data["pair"][:-1]
 
     # Send request to Kraken to get current trading price for currency-pair
     res_data = kraken.query_public("Ticker", req_data)
@@ -433,25 +425,34 @@ def price_one(bot, update):
         bot.send_message(chat_id, text=res_data["error"][0])
         return
 
-    # TODO: It is not necessary to iterate over items - just get the one thing we need
     msg = ""
     for currency_key, currency_value in res_data["result"].items():
-        # Get currency without 'trade to currency' value (for example 'ZEUR')
-        currency = currency_key[1:-len("Z" + config["trade_to_currency"])]
+        # Set currency without 'trade to currency' value (for example 'ZEUR')
+        currency = currency_key[:-len("Z" + config["trade_to_currency"])]
+        # Read last trade price
+        last_trade_price = currency_value["c"][0]
 
-        # Read last trade price and remove zeros at the end
-        last_trade_price = trim_zeros(currency_value["c"][0])
+        # Remove zeros at the end
+        last_trade_price = trim_zeros(last_trade_price)
+
+        #  Add currency to price
+        last_trade_price += " " + config["trade_to_currency"]
 
         # Create message
-        msg = currency + ": " + last_trade_price
-        break
+        msg += currency + ": " + last_trade_price + "\n"
 
-    bot.edit_message_text(message_id=message_id, chat_id=chat_id, text=msg)
+    bot.send_message(chat_id, text=msg)
 
 
 # Show the current real money value for all assets combined
-@restrict_access(config["user_ids"])
-def value_cmd(bot, update, chat_id=None):
+def value(bot, update):
+    chat_id = get_chat_id(update)
+
+    # Check if user is valid
+    if str(chat_id) != config["user_id"]:
+        bot.send_message(chat_id, text="Access denied")
+        return
+
     # Save message parameters in list
     msg_params = update.message.text.split(" ")
 
@@ -507,8 +508,7 @@ def value_cmd(bot, update, chat_id=None):
 
 
 # Check if GitHub hosts a different script then the current one
-def check_for_update(bot, updater):
-    chat_id = get_chat_id(updater)
+def check_for_update():
     # Get newest version of this script from GitHub
     headers = {"If-None-Match": config["update_hash"]}
     github_file = requests.get(config["update_url"], headers=headers)
@@ -516,71 +516,58 @@ def check_for_update(bot, updater):
     # Status code 304 = Not Modified (remote file has same hash, is the same version)
     if github_file.status_code == 304:
         # Send message that bot is up to date
-        # First user ID is super mega admin
         msg = "Bot is up to date"
-        updater.bot.send_message(chat_id=chat_id, text=msg)
+        updater.bot.send_message(chat_id=config["user_id"], text=msg)
     # Status code 200 = OK (remote file has different hash, is not the same version)
     elif github_file.status_code == 200:
         # Send message that new version is available
         msg = "New version available. Get it with /update"
-        updater.bot.send_message(chat_id=chat_id, text=msg)
+        updater.bot.send_message(chat_id=config["user_id"], text=msg)
     # Every other status code
     else:
         msg = "Update check not possible. Unexpected status code: " + github_file.status_code
-        updater.bot.send_message(chat_id=chat_id, text=msg)
+        updater.bot.send_message(chat_id=config["user_id"], text=msg)
 
 
-# This command will give the user the possibility to check for an update, update or restart the bot
-@restrict_access(config["user_ids"])
-def status_cmd(bot, update, chat_id=None):
+def status_bot(bot, update):
+    chat_id = get_chat_id(update)
 
-    buttons = [
+    # Check if user is valid
+    if str(chat_id) != config["user_id"]:
+        bot.send_message(chat_id, text="Access denied")
+        return
+
+    button_list = [
         InlineKeyboardButton("Update Check", callback_data="update_check"),
         InlineKeyboardButton("Update", callback_data="update"),
-        InlineKeyboardButton("Restart", callback_data="restart"),
-        InlineKeyboardButton("Shutdown", callback_data="shutdown")
+        InlineKeyboardButton("Restart", callback_data="restart")
     ]
 
-    footer = [
-        InlineKeyboardButton("Cancel", callback_data="cancel")
-    ]
-
-    reply_markup = InlineKeyboardMarkup(build_menu(buttons, n_cols=2, footer_buttons=footer))
+    reply_markup = InlineKeyboardMarkup(
+        build_menu(button_list, n_cols=2, header_buttons=None, footer_buttons=None))
     bot.send_message(chat_id, "Choose an option", reply_markup=reply_markup)
 
-    return ONE
 
-
-# Callback for the 'status' command - choose a sub-command
-def status_one(bot, update):
-    chat_id = get_chat_id(update)
-    message_id = update.callback_query.message.message_id
-
+# FIXME: How to remove message after user chose a button?
+def status_buttons(bot, update):
     data = update.callback_query.data
 
-    # FIXME: This will not set a new message (on update). Exclude the message from the method and add a return value
-    # then call this method and check return value. Show message dependant on return value.
-    # TODO: Change in whole app: Only send msg to user from config, not user that send msg
     if data == "update_check":
         check_for_update()
     elif data == "update":
-        update(bot, update)
+        update_bot(bot, update)
     elif data == "restart":
-        restart_cmd(bot, update)
-    elif data == "shutdown":
-        bot.edit_message_text("Shutting down...", chat_id, message_id)
-        exit()  # TODO: Test this
-    elif data == "cancel":
-        bot.edit_message_text("Canceled...", chat_id, message_id)
-        return
-    else:
-        bot.edit_message_text("Unknown callback command...", chat_id, message_id)
-        return
+        restart_bot(bot, update)
 
 
 # Download newest script, update the currently running script and restart
-@restrict_access(config["user_ids"])
-def update_cmd(bot, update, chat_id=None):
+def update_bot(bot, update):
+    chat_id = get_chat_id(update)
+
+    # Check if user is valid
+    if str(chat_id) != config["user_id"]:
+        bot.send_message(chat_id, text="Access denied")
+        return
 
     # Get newest version of this script from GitHub
     headers = {"If-None-Match": config["update_hash"]}
@@ -607,7 +594,7 @@ def update_cmd(bot, update, chat_id=None):
             file.write(github_file.text)
 
         # Restart the bot
-        restart_cmd(bot, update)
+        restart_bot(bot, update)
     # Every other status code
     else:
         msg = "Update not executed. Unexpected status code: " + github_file.status_code
@@ -615,8 +602,14 @@ def update_cmd(bot, update, chat_id=None):
 
 
 # Terminate this script
-@restrict_access(config["user_ids"])
-def shutdown_cmd(bot, update, chat_id=None):
+def shutdown_bot(bot, update):
+    chat_id = get_chat_id(update)
+
+    # Check if user is valid
+    if str(chat_id) != config["user_id"]:
+        bot.send_message(chat_id, text="Access denied")
+        return
+
     bot.send_message(chat_id, "Shutting down...")
 
     # Terminate bot
@@ -624,66 +617,45 @@ def shutdown_cmd(bot, update, chat_id=None):
 
 
 # Restart this python script
-@restrict_access(config["user_ids"])
-def restart_cmd(bot, update, chat_id=None):
+def restart_bot(bot, update):
+    chat_id = get_chat_id(update)
+
+    # Check if user is valid
+    if str(chat_id) != config["user_id"]:
+        bot.send_message(chat_id, text="Access denied")
+        return
+
     bot.send_message(chat_id, "Bot is restarting...")
     time.sleep(0.2)
     os.execl(sys.executable, sys.executable, *sys.argv)
 
 
+# Return chat ID for an Update object
+def get_chat_id(update):
+    if update.message:
+        return update.message.chat_id
+    else:
+        return update.callback_query.from_user["id"]
+
+
 # Add handlers to dispatcher
-dispatcher.add_handler(CommandHandler("update", update_cmd))
-dispatcher.add_handler(CommandHandler("menu", show_cmds))
-dispatcher.add_handler(CommandHandler("sync", monitor_open_orders))
-dispatcher.add_handler(CommandHandler("help", syntax_cmd))
-dispatcher.add_handler(CommandHandler("balance", balance_cmd))
-dispatcher.add_handler(CommandHandler("orders", orders_cmd))
-dispatcher.add_handler(CommandHandler("value", value_cmd))
-dispatcher.add_handler(CommandHandler("update", update_cmd))
-dispatcher.add_handler(CommandHandler("restart", restart_cmd))
-dispatcher.add_handler(CommandHandler("shutdown", shutdown_cmd))
-
-# TRADE command handler
-trade_handler = ConversationHandler(
-    entry_points=[CommandHandler('trade', trade_cmd)],
-    states={
-        ONE: [CallbackQueryHandler(trade_one)],
-        TWO: [CallbackQueryHandler(trade_two)],
-        THREE: [CallbackQueryHandler(trade_three)]
-    },
-    fallbacks=[CommandHandler('trade', trade_cmd)]
-)
-dispatcher.add_handler(trade_handler)
-
-# PRICE command handler
-price_handler = ConversationHandler(
-    entry_points=[CommandHandler('price', price_cmd)],
-    states={
-        ONE: [CallbackQueryHandler(price_one)]
-    },
-    fallbacks=[CommandHandler('price', price_cmd)]
-)
-dispatcher.add_handler(price_handler)
-
-# STATUS command handler
-status_handler = ConversationHandler(
-    entry_points=[CommandHandler('status', status_cmd)],
-    states={
-        ONE: [CallbackQueryHandler(status_one)]
-    },
-    fallbacks=[CommandHandler('status', status_cmd)]
-)
-dispatcher.add_handler(status_handler)
-
+dispatcher.add_handler(CommandHandler("help", syntax))
+dispatcher.add_handler(CommandHandler("balance", balance))
+dispatcher.add_handler(CommandHandler("trade", trade))
+dispatcher.add_handler(CommandHandler("orders", orders))
+dispatcher.add_handler(CommandHandler("price", price))
+dispatcher.add_handler(CommandHandler("value", value))
+dispatcher.add_handler(CommandHandler("update", update_bot))
+dispatcher.add_handler(CommandHandler("restart", restart_bot))
+dispatcher.add_handler(CommandHandler("status", status_bot))
+dispatcher.add_handler(CommandHandler("shutdown", shutdown_bot))
+dispatcher.add_handler(CallbackQueryHandler(status_buttons))
 
 # Start the bot
 updater.start_polling()
 
-# TODO: Sure that i don't need that?
-#updater.idle()
-
 # Check if script is the newest version
+check_for_update()
 
 # Monitor status changes of open orders
-
-# Show all possible commands
+monitor_open_orders()
